@@ -107,13 +107,7 @@ class App:
           )
 
         logging.info("Application started")
-        print("Running. Press Ctrl+C to stop.", file=sys.stderr)
-
-        # This loop will exit automatically when the node is close()d. It is also possible to use receive() instead.
-        async for m, _metadata in self.subscriptions[0]:
-          pass
-
-        
+        print("Running. Press Ctrl+C to stop.", file=sys.stderr)       
 
     def close(self) -> None:
         """
@@ -233,6 +227,7 @@ def main(config_filename, *args):
   print('started')
   try:
       asyncio.get_event_loop().run_until_complete(app.run())
+      asyncio.get_event_loop().run_forever()
   except KeyboardInterrupt:
       pass
   finally:
