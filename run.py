@@ -176,7 +176,7 @@ def record_event_data(msg, source_node_id, type_name, port, influxdb_queue=None)
   fields = msg
 
   if len(fields) > 0:
-      write_to_influxdb(transfer, fields, influxdb_queue)
+      write_to_influxdb(source_node_id, type_name, port, fields, influxdb_queue)
 
 
 def write_to_influxdb(source_node_id, type_name, port, fields, influxdb_queue, **kwargs):
@@ -218,7 +218,9 @@ def main(config_filename, *args):
       timeout=5,
       retries=5,
   )
-  influxdb_client.create_database(config.get('influxdb', 'database'))
+  
+  # client might not be allowed to create database, but it could happen here
+  #influxdb_client.create_database(config.get('influxdb', 'database'))
 
   influxdb_thread = threading.Thread(
       target=influxdb_writer,
