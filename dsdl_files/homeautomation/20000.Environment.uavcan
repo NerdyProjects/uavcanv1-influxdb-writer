@@ -1,5 +1,0 @@
-bool humidity_valid
-bool pressure_valid
-int19 temperature
-uint17 humidity
-uint18 pressure

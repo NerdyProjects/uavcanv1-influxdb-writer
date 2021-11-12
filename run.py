@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import sys
-import uavcan
 import threading
 import time
 from datetime import datetime
@@ -10,11 +9,123 @@ import influxdb
 import os
 import queue
 import signal
-import ephem
 import traceback
 from collections import defaultdict
 
+import pathlib
+import asyncio
+import logging
+import importlib
+import pyuavcan
+
+from pyuavcan.presentation import Presentation, Subscriber
+from pyuavcan.transport.can import CANTransport
+from pyuavcan.transport.can.media.socketcan import SocketCANMedia
+from pyuavcan.dsdl._builtin_form import to_builtin
+
 running = True
+
+# Prepare DSDL for uavcan v1
+compiled_dsdl_dir = pathlib.Path(__file__).resolve().parent / "compiled_dsdl"
+sys.path.insert(0, str(compiled_dsdl_dir))
+
+try:
+  import housebus
+  import pyuavcan.application
+except (ImportError, AttributeError):  # Redistributable applications typically don't need this section.
+    logging.warning("Transcompiling DSDL, this may take a while")
+    src_dir = pathlib.Path(__file__).resolve().parent
+    pyuavcan.dsdl.compile_all(
+        [
+            src_dir / "custom_data_types/housebus",
+            src_dir / "public_regulated_data_types/uavcan/",
+        ],
+        output_directory=compiled_dsdl_dir,
+    )
+    importlib.invalidate_caches()  # Python runtime requires this.
+    import housebus
+    import pyuavcan.application
+
+# Import other namespaces we're planning to use. Nested namespaces are not auto-imported, so in order to reach,
+# say, "uavcan.node.Heartbeat", you have to "import uavcan.node".
+import uavcan.node  # noqa
+import housebus.heating.heatmeter_1_0
+import housebus.heating.heating_status_1_0
+import housebus.electricity.meter_1_0
+
+
+class App:
+    SUBSCRIBE_TO = [
+      { 'port': 1000, 'data_type': housebus.heating.heatmeter_1_0, 'name': 'heatmeter'},
+      { 'port': 1010, 'data_type': housebus.electricity.meter_1_0, 'name': 'meter_heatpump'},
+      { 'port': 1001, 'data_type': housebus.heating.heating_status_1_0, 'name': 'heating_status'},
+    ]
+
+    def __init__(self, transport, record_method, influxdb_queue) -> None:
+        node_info = uavcan.node.GetInfo_1_0.Response(
+            software_version=uavcan.node.Version_1_0(major=1, minor=0),
+            name="uavcanv1.logger",
+        )
+        self.influxdb_queue = influxdb_queue
+        self.record_method = record_method
+
+        # The Node class is basically the central part of the library -- it is the bridge between the application and
+        # the UAVCAN network. Also, it implements certain standard application-layer functions, such as publishing
+        # heartbeats and port introspection messages, responding to GetInfo, serving the register API, etc.
+        # The register file stores the configuration parameters of our node (you can inspect it using SQLite Browser).
+        self._node = pyuavcan.application.make_node(info = node_info, transport = transport)
+
+        # Published heartbeat fields can be configured as follows.
+        self._node.heartbeat_publisher.mode = uavcan.node.Mode_1_0.OPERATIONAL  # type: ignore
+        self._node.heartbeat_publisher.vendor_specific_status_code = os.getpid() % 100
+
+
+        self._node.start()  # Don't forget to start the node!
+
+    async def run(self) -> None:
+        """
+        The main method that runs the business logic. It is also possible to use the library in an IoC-style
+        by using receive_in_background() for all subscriptions if desired.
+        """
+
+        def make_handler(port):
+          async def handler(msg, transfer):
+            #print(port)
+            #print(str(msg._MODEL_))
+
+            self.record_method(to_builtin(msg), transfer.source_node_id, str(msg._MODEL_), port, self.influxdb_queue)
+          
+          return handler
+
+        self.subscriptions = []
+        for s in self.SUBSCRIBE_TO:
+          subscriber = self._node.presentation.make_subscriber(s['data_type'], s['port'])
+          subscriber.receive_in_background(make_handler(s['port']))
+
+          self.subscriptions.append(
+            subscriber
+          )
+
+        logging.info("Application started")
+        print("Running. Press Ctrl+C to stop.", file=sys.stderr)
+
+        # This loop will exit automatically when the node is close()d. It is also possible to use receive() instead.
+        async for m, _metadata in self.subscriptions[0]:
+          pass
+
+        
+
+    def close(self) -> None:
+        """
+        This will close all the underlying resources down to the transport interface and all publishers/servers/etc.
+        All pending tasks such as serve_in_background()/receive_in_background() will notice this and exit automatically.
+        """
+        self._node.close()
+
+
+running = True
+
+  
 
 def shutdown(signal, frame):
   global running
@@ -22,10 +133,6 @@ def shutdown(signal, frame):
 
 
 signal.signal(signal.SIGTERM, shutdown)
-
-uavcan.load_dsdl(
-    os.path.join(os.path.dirname(__file__), 'dsdl_files', 'homeautomation'))
-
 
 def influxdb_writer(q, influxdb_client):
   while running:
@@ -53,10 +160,52 @@ def influxdb_writer(q, influxdb_client):
     time.sleep(1)
 
 
+
+
+def read_config(filename):
+  config = configparser.ConfigParser()
+  config.read(os.path.join(os.path.dirname(__file__), 'defaults.ini'))
+  config.read(filename)
+  return config
+
+
+def record_event_data(msg, source_node_id, type_name, port, influxdb_queue=None):
+  if influxdb_queue is None:
+    raise Exception('please pass in an influxdb_queue option')
+
+  fields = msg
+
+  if len(fields) > 0:
+      write_to_influxdb(transfer, fields, influxdb_queue)
+
+
+def write_to_influxdb(source_node_id, type_name, port, fields, influxdb_queue, **kwargs):
+  data = {
+    "measurement":
+        type_name,
+    "tags": {
+        "node_id": source_node_id,
+        "port": port
+    },
+    "time": int(round(time.time()*1000)),
+    "fields":
+        fields,
+  }
+  extra_tags = kwargs.get('extra_tags')
+  if extra_tags:
+    data['tags'].update(extra_tags)
+
+  influxdb_queue.put(data)
+  
 def main(config_filename, *args):
-  node_infos = defaultdict(lambda: dict(last_seen=None, last_info=None))
   config = read_config(config_filename)
   influxdb_queue = queue.Queue()
+  can_if = config.get('canbus', 'ifname')
+  node_id = config.getint('node', 'id')
+  transport = CANTransport(SocketCANMedia(can_if, 8), node_id)
+  app = App(transport, record_event_data, influxdb_queue)
+  
+  logging.root.setLevel(logging.INFO)
 
   influxdb_client = influxdb.InfluxDBClient(
       config.get('influxdb', 'host'),
@@ -69,203 +218,24 @@ def main(config_filename, *args):
       timeout=5,
       retries=5,
   )
-  #influxdb_client.create_database(config.get('influxdb', 'database'))
-
-  node_info = uavcan.protocol.GetNodeInfo.Response()
-  node_info.name = config.get('node', 'name')
-
-  node = uavcan.make_node(
-      config.get('canbus', 'ifname'),
-      node_id=config.getint('node', 'id'),
-      node_info=node_info,
-  )
-
-  uavcan_types = [
-      uavcan.protocol.NodeStatus,
-      uavcan.thirdparty.homeautomation.EventCount,
-      uavcan.thirdparty.homeautomation.Environment,
-      uavcan.thirdparty.homeautomation.ConductionSensor,
-      uavcan.thirdparty.homeautomation.Obis,
-      uavcan.thirdparty.homeautomation.GreywaterPumpStatus,
-      uavcan.thirdparty.homeautomation.HeaterStatus,
-      uavcan.thirdparty.homeautomation.BathroomStatus,
-      uavcan.thirdparty.homeautomation.BoilerStatus,
-      uavcan.thirdparty.homeautomation.Motion,
-  ]
-
-  for uavcan_type in uavcan_types:
-    node.add_handler(
-        uavcan_type,
-        record_event_data,
-        influxdb_queue=influxdb_queue,
-    )
-
-  def node_status_cb(event):
-    node_infos[event.transfer.source_node_id]['last_seen'] = datetime.now()
-
-  node.add_handler(uavcan.protocol.NodeStatus, node_status_cb)
-  node.add_handler(uavcan.protocol.RestartNode, restart_request)
-
-  node.mode = uavcan.protocol.NodeStatus().MODE_OPERATIONAL
-  node.health = uavcan.protocol.NodeStatus().HEALTH_OK
+  influxdb_client.create_database(config.get('influxdb', 'database'))
 
   influxdb_thread = threading.Thread(
       target=influxdb_writer,
       kwargs={
           'q': influxdb_queue,
           'influxdb_client': influxdb_client
-      })
+     })
   influxdb_thread.start()
 
   print('started')
-
-  def publish_current_time():
-    o = ephem.Observer()
-    o.lat = '51.3699'
-    o.long = '12.7437'
-    o.horizon = '+6'
-    s = ephem.Sun()
-    daylight = o.next_setting(s) < o.next_rising(s)
-    microseconds = round(time.time() * 1000000)
-    msg = uavcan.thirdparty.homeautomation.Time(usec=microseconds, daylight=daylight)
-    node.broadcast(msg)
-
-  node.periodic(1, publish_current_time)
-
-  while running:
-    try:
-      node.spin(1)
-      get_node_infos(node, node_infos, influxdb_queue)
-      receive_node_info(config.getint('node', 'id'), node_info, influxdb_queue)
-    except uavcan.UAVCANException as ex:
-      print('Node error:', ex)
-
-  node.close()
+  try:
+      asyncio.get_event_loop().run_until_complete(app.run())
+  except KeyboardInterrupt:
+      pass
+  finally:
+      app.close()
 
 
-def restart():
-  time.sleep(0.5)  # give it a moment to send the response
-  print('restarting')
-  sys.stdout.flush()
-  os.execv(__file__, sys.argv)
-
-
-def restart_request(event):
-
-  if event.request.magic_number != event.request.MAGIC_NUMBER:
-    return uavcan.protocol.RestartNode.Response(ok=False)
-
-  threading.Thread(target=restart, daemon=True).start()
-  return uavcan.protocol.RestartNode.Response(ok=True)
-
-
-def read_config(filename):
-  config = configparser.ConfigParser()
-  config.read(os.path.join(os.path.dirname(__file__), 'defaults.ini'))
-  config.read(filename)
-  return config
-
-
-def receive_node_info(node_id, node_info, influxdb_queue):
-
-  # node info comes with node status too
-
-  fields = extract_fields(node_info.status._fields)
-
-  fields.update({
-      'name': str(node_info.name),
-      'software_version.major': node_info.software_version.major,
-      'software_version.minor': node_info.software_version.minor,
-  })
-
-  influxdb_queue.put({
-      "measurement": 'uavcan.protocol.NodeInfo',
-      "tags": {
-          "node_id": node_id,
-      },
-      "time": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
-      "fields": fields,
-  })
-
-
-def get_node_infos(node, node_infos, influxdb_queue):
-
-  def handle_event_for(node_id, event):
-    if not event:
-      return
-
-    node_infos[node_id]['info'] = event.transfer.payload
-    node_infos[node_id]['last_info'] = datetime.now()
-    return receive_node_info(node_id, event.transfer.payload, influxdb_queue),
-
-  now = datetime.now()
-  for node_id, node_info in node_infos.items():
-    if not isinstance(node_info['last_seen'], datetime):
-      continue
-    last_seen_ago = now - node_info['last_seen']
-    last_info_ago = now - node_info['last_info'] if isinstance(
-        node_info['last_info'], datetime) else None
-    if last_seen_ago.total_seconds() < 5 and (
-        last_info_ago is None or last_info_ago.total_seconds() > 3600):
-      node.request(
-          uavcan.protocol.GetNodeInfo.Request(),
-          node_id,
-          lambda event, node_id=node_id: handle_event_for(node_id, event),
-      )
-
-
-def extract_fields(message_fields):
-
-  fields = {}
-
-  for key, value in message_fields.items():
-    if isinstance(value, uavcan.transport.PrimitiveValue):
-      if isinstance(value.value, bool):
-          fields[key + '_int'] = int(value.value)
-      fields[key] = value.value
-    elif isinstance(value, uavcan.transport.ArrayValue):
-      for idx, array_value in enumerate(value):
-        fields['{}{}'.format(key, idx)] = array_value
-
-  return fields
-
-
-def record_event_data(event, influxdb_queue=None):
-  if influxdb_queue is None:
-    raise Exception('please pass in an influxdb_queue option')
-
-  fields = extract_fields(event.message._fields)
-
-  if len(fields) > 0:
-    if event.message._type.full_name == 'homeautomation.Obis':
-      # turn Obis code into a tag
-      code = event.message._fields.get('code')
-      joined_code = '.'.join([str(x) for x in code])
-      if code:
-        del event.message._fields['code']
-        fields = extract_fields(event.message._fields)
-
-      write_to_influxdb(event, fields, influxdb_queue, extra_tags={'code': joined_code})
-    else:
-      write_to_influxdb(event, fields, influxdb_queue)
-
-
-def write_to_influxdb(event, fields, influxdb_queue, **kwargs):
-  data = {
-    "measurement":
-        event.message._type.full_name,
-    "tags": {
-        "node_id": event.transfer.source_node_id,
-    },
-    "time": int(round(event.transfer.ts_real*1000)),
-    "fields":
-        fields,
-  }
-  extra_tags = kwargs.get('extra_tags')
-  if extra_tags:
-    data['tags'].update(extra_tags)
-
-  influxdb_queue.put(data)
-
-if __name__ == '__main__':
-  main(*sys.argv[1:])
+if __name__ == "__main__":
+    main(*sys.argv[1:])

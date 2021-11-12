@@ -1,3 +1,0 @@
-bool error
-bool[7] status
-uint8[<=7] quality
